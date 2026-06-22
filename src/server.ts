@@ -19,6 +19,47 @@ async function getSharedContext() {
   return getContext(browser);
 }
 
+// Extract the Cobalt JWT from DDB's localStorage so we can send it as
+// Authorization: Bearer on character-service calls. DDB's backend uses this
+// to verify DM status for non-owned characters — cookies alone aren't enough.
+async function extractCobaltToken(page: Awaited<ReturnType<typeof getPage>>): Promise<string | null> {
+  return page.evaluate(() => {
+    for (const storage of [localStorage, sessionStorage]) {
+      for (const key of Object.keys(storage)) {
+        const val = storage.getItem(key);
+        if (!val) continue;
+        if (val.startsWith("eyJ")) return val;
+        try {
+          const parsed = JSON.parse(val);
+          for (const field of ["token", "accessToken", "cobaltToken", "authToken", "id_token"]) {
+            if (typeof parsed?.[field] === "string" && parsed[field].startsWith("eyJ"))
+              return parsed[field];
+          }
+        } catch {}
+      }
+    }
+    return null;
+  });
+}
+
+async function fetchCharacterById(
+  context: Awaited<ReturnType<typeof getSharedContext>>,
+  page: Awaited<ReturnType<typeof getPage>>,
+  charId: number,
+): Promise<DDBCharacter> {
+  const token = await extractCobaltToken(page);
+  const headers: Record<string, string> = { Accept: "application/json" };
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+
+  const resp = await context.request.get(
+    `https://character-service.dndbeyond.com/character/v5/character/${charId}`,
+    { headers },
+  );
+  if (!resp.ok()) throw new Error(`HTTP ${resp.status()} for character ${charId}`);
+  const raw = (await resp.json()) as Record<string, unknown>;
+  return raw.data as DDBCharacter;
+}
+
 function modStr(score: number): string {
   const mod = Math.floor((score - 10) / 2);
   return mod >= 0 ? `+${mod}` : `${mod}`;
@@ -306,19 +347,67 @@ export function createServer(): McpServer {
           id = parseInt(match.id, 10);
         }
 
-        const raw = await page.evaluate(async (charId: string) => {
-          const resp = await fetch(
-            `https://character-service.dndbeyond.com/character/v5/character/${charId}`,
-            { credentials: "include", headers: { Accept: "application/json" } },
-          );
-          if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
-          return resp.json();
-        }, String(id));
-
-        const character = (raw as Record<string, unknown>).data as DDBCharacter;
+        const character = await fetchCharacterById(context, page, id);
         return ok(formatSheet(character));
       } catch (e) {
         return err(`Failed to get character: ${String(e)}`);
+      }
+    },
+  );
+
+  // ─── ddb_get_campaign_sheets ──────────────────────────────────────────────
+  server.tool(
+    "ddb_get_campaign_sheets",
+    "Fetch the full character sheet for every character in a campaign. Intended for use when you are the DM.",
+    {
+      campaignId: z.number().describe("Numeric campaign ID"),
+    },
+    async ({ campaignId }) => {
+      try {
+        const context = await getSharedContext();
+        const page = await getPage(context);
+
+        if (!(await isLoggedIn(page))) return err("Not logged in. Run ddb_login first.");
+
+        await page.goto(`https://www.dndbeyond.com/campaigns/${campaignId}`, {
+          waitUntil: "networkidle",
+          timeout: 30000,
+        });
+        await page.waitForTimeout(2000);
+
+        const characterIds = await page.evaluate(() => {
+          const ids: number[] = [];
+          document.querySelectorAll("li.ddb-campaigns-character-card-wrapper").forEach((el) => {
+            const link = el.querySelector(
+              "a[href*='/characters/']",
+            ) as HTMLAnchorElement | null;
+            const match = (link?.href ?? "").match(/\/characters\/(\d+)/);
+            if (match) ids.push(parseInt(match[1], 10));
+          });
+          return [...new Set(ids)];
+        });
+
+        if (!characterIds.length) {
+          return err(`No characters found in campaign ${campaignId}. Make sure you are the DM and the campaign has members.`);
+        }
+
+        const sheets: string[] = [];
+        const errors: string[] = [];
+        for (const charId of characterIds) {
+          try {
+            const character = await fetchCharacterById(context, page, charId);
+            sheets.push(formatSheet(character));
+          } catch (e) {
+            errors.push(`Character ${charId}: ${String(e)}`);
+          }
+        }
+
+        const output = [`# Campaign ${campaignId} — All Character Sheets`];
+        if (sheets.length) output.push(`\n---\n\n${sheets.join("\n\n---\n\n")}`);
+        if (errors.length) output.push(`\n\n---\n\n**Fetch errors:**\n${errors.map((e) => `- ${e}`).join("\n")}`);
+        return ok(output.join(""));
+      } catch (e) {
+        return err(`Failed to get campaign sheets: ${String(e)}`);
       }
     },
   );

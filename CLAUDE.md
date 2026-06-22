@@ -9,6 +9,7 @@ MCP server that gives Claude access to D&D Beyond character sheets and campaigns
 - **ddb_list_characters** — List all characters on the account (name, ID, level, race, class).
 - **ddb_get_character** — Fetch a full character sheet by numeric ID or name substring. Returns HP, ability scores, spells, inventory, currency, traits, and campaign.
 - **ddb_get_campaign** — Fetch campaign details and roster by numeric campaign ID.
+- **ddb_get_campaign_sheets** — Fetch the full character sheet for every player character in a campaign (DM use).
 
 ## Usage pattern
 
