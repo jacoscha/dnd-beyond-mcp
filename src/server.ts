@@ -47,17 +47,56 @@ async function fetchCharacterById(
   page: Awaited<ReturnType<typeof getPage>>,
   charId: number,
 ): Promise<DDBCharacter> {
-  const token = await extractCobaltToken(page);
-  const headers: Record<string, string> = { Accept: "application/json" };
-  if (token) headers["Authorization"] = `Bearer ${token}`;
+  // Attempt 1: API call via Playwright request context (full cookie jar) + JWT header.
+  // Works for own characters; may 403 for player characters if DDB restricts API-level DM access.
+  try {
+    const token = await extractCobaltToken(page);
+    const headers: Record<string, string> = { Accept: "application/json" };
+    if (token) headers["Authorization"] = `Bearer ${token}`;
 
-  const resp = await context.request.get(
-    `https://character-service.dndbeyond.com/character/v5/character/${charId}`,
-    { headers },
-  );
-  if (!resp.ok()) throw new Error(`HTTP ${resp.status()} for character ${charId}`);
-  const raw = (await resp.json()) as Record<string, unknown>;
-  return raw.data as DDBCharacter;
+    const resp = await context.request.get(
+      `https://character-service.dndbeyond.com/character/v5/character/${charId}`,
+      { headers },
+    );
+    if (resp.ok()) {
+      const raw = (await resp.json()) as Record<string, unknown>;
+      return raw.data as DDBCharacter;
+    }
+  } catch {}
+
+  // Attempt 2: Navigate to the character page in the browser (where DM access is enforced
+  // by the web UI) and make the API call from within that page's JavaScript context.
+  // This lets DDB's own session/cookie logic handle the DM authorization check.
+  await page.goto(`https://www.dndbeyond.com/characters/${charId}`, {
+    waitUntil: "networkidle",
+    timeout: 30000,
+  });
+  await page.waitForTimeout(2000);
+
+  const raw = await page.evaluate(async (id: string) => {
+    // First try extracting from Next.js server-side props embedded in the page.
+    const nextDataEl = document.getElementById("__NEXT_DATA__");
+    if (nextDataEl) {
+      try {
+        const nextData = JSON.parse(nextDataEl.textContent ?? "{}") as Record<string, unknown>;
+        const pageProps = (nextData?.props as Record<string, unknown>)?.pageProps as Record<string, unknown> | undefined;
+        const embedded = pageProps?.character ?? pageProps?.characterData ?? pageProps?.data;
+        if (embedded) return embedded;
+      } catch {}
+    }
+
+    // Fall back to the character-service API from within the character page context,
+    // where the session cookies are fully established for this character.
+    const resp = await fetch(
+      `https://character-service.dndbeyond.com/character/v5/character/${id}`,
+      { credentials: "include", headers: { Accept: "application/json" } },
+    );
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const json = (await resp.json()) as Record<string, unknown>;
+    return json.data;
+  }, String(charId));
+
+  return raw as DDBCharacter;
 }
 
 function modStr(score: number): string {
@@ -437,7 +476,7 @@ export function createServer(): McpServer {
             name?: string;
             dungeonMaster?: string;
             description?: string;
-            characters?: Array<{ character: string; level: string; player: string }>;
+            characters?: Array<{ character: string; id: string; level: string; player: string }>;
           } = {};
 
           const name = document.querySelector("h1.page-title")?.textContent?.trim();
@@ -453,7 +492,7 @@ export function createServer(): McpServer {
           );
           if (descEl) data.description = descEl.textContent?.trim();
 
-          const characters: Array<{ character: string; level: string; player: string }> = [];
+          const characters: Array<{ character: string; id: string; level: string; player: string }> = [];
           document.querySelectorAll("li.ddb-campaigns-character-card-wrapper").forEach((el) => {
             const charName =
               el
@@ -466,7 +505,10 @@ export function createServer(): McpServer {
             );
             const level = secondaries[0]?.textContent?.trim() ?? "";
             const player = (secondaries[1]?.textContent?.trim() ?? "").replace(/^Player:\s*/i, "");
-            if (charName) characters.push({ character: charName, level, player });
+            const link = el.querySelector("a[href*='/characters/']") as HTMLAnchorElement | null;
+            const idMatch = (link?.href ?? "").match(/\/characters\/(\d+)/);
+            const id = idMatch?.[1] ?? "";
+            if (charName) characters.push({ character: charName, id, level, player });
           });
           if (characters.length) data.characters = characters;
 
@@ -479,8 +521,9 @@ export function createServer(): McpServer {
         if (campaign.characters?.length) {
           lines.push("\n## Roster");
           for (const c of campaign.characters) {
+            const idPart = c.id ? ` \`ID: ${c.id}\`` : "";
             lines.push(
-              `- **${c.character}** — ${c.level}${c.player ? ` (Player: ${c.player})` : ""}`,
+              `- **${c.character}**${idPart} — ${c.level}${c.player ? ` (Player: ${c.player})` : ""}`,
             );
           }
         }
